@@ -1,0 +1,7 @@
+### Installation instructions for mac ###
+1. xcode-select --install
+2. sudo xcode-select --reset
+3. sudo xcode-select -switch /
+4. pip intall -r requirements.txt
+5. Follow guide here to install oracle client libraries https://oracle.github.io/odpi/doc/installation.html#macos
+

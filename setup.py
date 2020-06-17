@@ -20,6 +20,9 @@ setuptools.setup(
 
     install_requires=[
         "aws-cdk.core==1.45.0",
+        "aws_cdk.aws_ec2",
+        "aws-cdk.aws-rds",
+        "cx_Oracle"
     ],
 
     python_requires=">=3.6",
