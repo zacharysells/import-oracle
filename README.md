@@ -34,5 +34,5 @@ export DB_HOST="something.rds.amazonaws.com" # Get this value from the deployed 
 $ python import-oracle.py SCL test_01 input.txt --header --empty-target
 
 # Usage info
-$ python import_oracle/import-oracle.py --help
+$ python import-oracle.py --help
 ```
