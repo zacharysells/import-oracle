@@ -5,8 +5,12 @@ __pycache__
 .env
 *.egg-info
 .vscode
-
+.venv
 # CDK asset staging directory
 .cdk.staging
 cdk.out
 cdk.json
+
+import_oracle/csv/*
+import_oracle/json/*
+import_oracle/sql/*

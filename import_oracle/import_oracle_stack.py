@@ -12,15 +12,14 @@ class ImportOracleStack(core.Stack):
         rds_instance = rds.DatabaseInstance(
             self, "rds",
             database_name="ORCL",
-            master_username=self.node.try_get_context("oracle-rds-username"),
-            master_user_password=core.SecretValue.plain_text(self.node.try_get_context("oracle-rds-password")),
-            engine=rds.DatabaseInstanceEngine.ORACLE_S_E1,
+            credentials=rds.Credentials.from_password(self.node.try_get_context("oracle-rds-username"), core.SecretValue(self.node.try_get_context("oracle-rds-password"))),
+            engine=rds.DatabaseInstanceEngine.ORACLE_SE2,
             license_model=rds.LicenseModel.LICENSE_INCLUDED,
             vpc=vpc,
             deletion_protection=False,
-            instance_class=ec2.InstanceType.of(
+            instance_type=ec2.InstanceType.of(
                 ec2.InstanceClass.BURSTABLE3, 
-                ec2.InstanceSize.MICRO,
+                ec2.InstanceSize.SMALL,
             ),
             vpc_placement=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC)
         )
