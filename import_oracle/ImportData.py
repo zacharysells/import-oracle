@@ -8,6 +8,7 @@ import cx_Oracle
 
 parser = argparse.ArgumentParser()
 parser.add_argument("json_file_path", help="Relative path to file or file glob of json data import files")
+parser.add_argument("--executesql", help="`json_file_path` arg will be parsed as an ExecuteSQL script.", action="store_true")
 parser.add_argument("--selectall", help="Print all rows in table", action="store_true")
 parser.add_argument("--bootstrap", help="Bootstrap db with provided .sql file. WARNING this will drop the table first.")
 args = parser.parse_args()
@@ -66,7 +67,13 @@ def map_mapping_types(row, mapping_list, header=True, header_values=None):
                 source_column = int(header_values.index(elem['Source']))
             else:
                 source_column = i
-            row_string = row_string + (",'%s'" % str(row[source_column]).replace("'", "''"))
+            # Check for db_mapping parameter
+            if elem.get('DB_CONVERSION'):
+                cell_value = elem['DB_CONVERSION'].replace('?', row[source_column])
+                row_string = row_string + (",%s" % cell_value)
+            else:
+                cell_value = str(row[source_column]).replace("'", "''")
+                row_string = row_string + (",'%s'" % cell_value)
         else:
             logging.fatal("Unknown type %s in Column Mappings" % e)
             sys.exit(1)
@@ -75,34 +82,44 @@ def map_mapping_types(row, mapping_list, header=True, header_values=None):
 def process_import(descriptor_file):
     # descriptor_file arg should be a relative path to a .json 
     # file with all the required info to handle the data import.
+
     with open(descriptor_file, 'r') as fp:
         descriptor_file_data = json.load(fp)
-        db_host = descriptor_file_data['TargetInfo']['DBServer']
-        db_port = int(descriptor_file_data['TargetInfo']['DBPort'])
-        db_schema = descriptor_file_data['TargetInfo']['Schema']
-        db_service = descriptor_file_data['TargetInfo']['DBService']
-        db_user = descriptor_file_data['TargetInfo']['UserName']
-        db_pass = descriptor_file_data['TargetInfo']['PassWord']
-        db_table = descriptor_file_data['TargetInfo']['TableName']
-        db_encoding = descriptor_file_data['TargetInfo'].get('DBEncoding', 'UTF-8')
-
-        source_file = descriptor_file_data['SourceInfo']['Location']
-        source_delimeter = descriptor_file_data['SourceInfo']['Delimiter']
-        source_filetype = descriptor_file_data['SourceInfo']['FileType']
-        source_fileheader = True if descriptor_file_data['SourceInfo']['FileHeader'].lower() == 'yes' else False
-        MAX_BYTES_PER_CHUNK = descriptor_file_data['MaxBytesPerChunk']
+        if 'TargetInfo' in descriptor_file_data:
+            db_host = descriptor_file_data['TargetInfo']['DBServer']
+            db_port = int(descriptor_file_data['TargetInfo']['DBPort'])
+            db_schema = descriptor_file_data['TargetInfo']['Schema']
+            db_service = descriptor_file_data['TargetInfo']['DBService']
+            db_user = descriptor_file_data['TargetInfo']['UserName']
+            db_pass = descriptor_file_data['TargetInfo']['PassWord']
+            db_table = descriptor_file_data['TargetInfo']['TableName']
+            db_encoding = descriptor_file_data['TargetInfo'].get('DBEncoding', 'UTF-8')
+        if 'SourceInfo' in descriptor_file_data:
+            source_file = descriptor_file_data['SourceInfo']['Location']
+            source_delimeter = descriptor_file_data['SourceInfo']['Delimiter']
+            source_filetype = descriptor_file_data['SourceInfo']['FileType']
+            source_fileheader = True if descriptor_file_data['SourceInfo']['FileHeader'].lower() == 'yes' else False
+            MAX_BYTES_PER_CHUNK = descriptor_file_data['MaxBytesPerChunk']
 
     connection = create_db_connection(db_host, db_port, db_user, db_pass, db_service, db_encoding)
     if args.bootstrap:
         with open(args.bootstrap, 'r') as fp:
             try:
-                execute_sql(connection, "DROP TABLE %s" % db_table)
+                execute_sql(connection, "DROP TABLE %s.%s" % (db_schema, db_table))
             except:
                 pass
             for sql_command in fp.read().split(';'):
                 execute_sql(connection, sql_command)
     if args.selectall:
         select_all(connection, db_table)
+        return
+
+    if args.executesql:
+        logging.info("Running 'ExecuteSQL' method on %s" % descriptor_file)
+        sorted_sql_statements = sorted(descriptor_file_data['SQLStatements'], key=lambda k: int(k.get('Order') or sys.maxsize))
+        for sql in sorted_sql_statements:
+            execute_sql(connection, sql['SQL'].rstrip(';'))
+
         return
 
     sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
