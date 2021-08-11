@@ -2,9 +2,12 @@ import glob
 import logging
 import json
 import sys
+import re
 import os
 import argparse
+import datetime
 import cx_Oracle
+import xlsxwriter
 
 parser = argparse.ArgumentParser()
 parser.add_argument("json_file_path", help="Relative path to file or file glob of json data import files")
@@ -19,11 +22,18 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-def execute_sql(connection, query, commit=True):
+def execute_sql(connection, query, commit=True, rollback_transaction=False):
     logging.info('Executing SQL query="%s"' % query)
     curs = connection.cursor()
-    curs.execute(query)
-    connection.commit()
+    try:
+        curs.execute(query)
+    except Exception as e:
+        if rollback_transaction:
+            logging.error('Failed query. Rolling back transactions.')
+            connection.rollback()
+        raise e
+    if commit:
+        connection.commit()
     pass
 
 def executemany_sql(connection, db_table, fields, rows, commit=True):
@@ -39,6 +49,13 @@ def executemany_sql(connection, db_table, fields, rows, commit=True):
         errorObj, = e.args
         logging.error("Row %d has error %s" % (curs.rowcount, errorObj.message))
         raise e
+
+def execute_select_sql(connection, query):
+    curs = connection.cursor()
+    curs.prefetchrows = 1000
+    curs.arraysize = 1000
+    curs.execute(query)
+    return curs.fetchall()
 
 def select_all(connection, db_table):
     curs = connection.cursor()
@@ -79,10 +96,80 @@ def map_mapping_types(row, mapping_list, header=True, header_values=None):
             sys.exit(1)
     return row_string.lstrip(',')
 
+def process_descriptor_file(descriptor_file):
+    with open(descriptor_file, 'r') as fp:
+        descriptor_file_data = json.load(fp)
+        if 'FileName' in descriptor_file_data['TargetInfo']:
+            process_export(descriptor_file)
+        if 'DBServer' in descriptor_file_data['TargetInfo']:
+            process_import(descriptor_file)
+
+def process_export(descriptor_file):
+    logging.info('Processing export for %s' % descriptor_file)
+    with open(descriptor_file, 'r') as fp:
+        descriptor_file_data = json.load(fp)
+        if 'SourceInfo' in descriptor_file_data:
+            db_host = descriptor_file_data['SourceInfo']['DBServer']
+            db_port = int(descriptor_file_data['SourceInfo']['DBPort'])
+            db_schema = descriptor_file_data['SourceInfo']['Schema']
+            db_service = descriptor_file_data['SourceInfo']['DBService']
+            db_user = descriptor_file_data['SourceInfo']['UserName']
+            db_pass = descriptor_file_data['SourceInfo']['PassWord']
+            db_table = descriptor_file_data['SourceInfo'].get('TableName')
+            db_encoding = descriptor_file_data['SourceInfo'].get('DBEncoding', 'UTF-8')
+        if 'TargetInfo' in descriptor_file_data:
+            source_location = descriptor_file_data['TargetInfo']['Location']
+            source_file = descriptor_file_data['TargetInfo']['FileName']
+            date_format = descriptor_file_data['TargetInfo'].get('DateFmt', '{:%m/%d/%y %H:%M:%S}')
+    connection = create_db_connection(db_host, db_port, db_user, db_pass, db_service, db_encoding)
+
+    sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
+    select_query = 'SELECT %s from %s' % (','.join([x['Source'] for x in sorted_col_mappings]), db_table)
+    data = execute_select_sql(connection, select_query)
+
+    logging.info('Opening %s for writing' % os.path.join(source_location, source_file))
+    workbook = xlsxwriter.Workbook(os.path.join(source_location, source_file))
+    worksheet = workbook.add_worksheet()
+    header_format = workbook.add_format({
+        'border': 1,
+        'bg_color': '#C6EFCE',
+        'bold': True,
+        'text_wrap': True,
+        'valign': 'vcenter',
+        'indent': 1,
+    })
+    headers = [x['Target'] for x in sorted_col_mappings]
+    worksheet.write_row('A1', headers, header_format)
+    nrow = 1 # Start at one, skip header row
+    for row in data:
+        logging.debug('Inserting row %s into spreadsheet' % list(row))
+        ncolumn = 0
+        for item in row:
+            if isinstance(item, datetime.datetime):
+                item = date_format.format(item)
+            worksheet.write(nrow, ncolumn, item)
+            ncolumn += 1
+        nrow += 1
+
+    # Create Dropdown lists if needed
+    for i, col_mapping in enumerate(sorted_col_mappings):
+        if 'DDList' in col_mapping and col_mapping['DDList'].lower() in {'yes', 'true'}:
+            logging.info('Applying dropdown list validation on column "%s"' % col_mapping['Source'])
+            sql_query = 'SELECT DISTINCT %s from %s' % (col_mapping['Source'], db_table)
+            unique_elements_in_column = execute_select_sql(connection, sql_query)
+            unique_elements_in_column = sum([list(x) for x in unique_elements_in_column],[])
+            worksheet.data_validation(1, i, 1048575, i, {
+                'validate': 'list',
+                'source': unique_elements_in_column
+            })
+    logging.info('Closing %s.' % os.path.join(source_location, source_file))
+    workbook.close()
+
+
 def process_import(descriptor_file):
     # descriptor_file arg should be a relative path to a .json 
     # file with all the required info to handle the data import.
-
+    logging.info('Processing import for %s' % descriptor_file)
     with open(descriptor_file, 'r') as fp:
         descriptor_file_data = json.load(fp)
         if 'TargetInfo' in descriptor_file_data:
@@ -92,7 +179,7 @@ def process_import(descriptor_file):
             db_service = descriptor_file_data['TargetInfo']['DBService']
             db_user = descriptor_file_data['TargetInfo']['UserName']
             db_pass = descriptor_file_data['TargetInfo']['PassWord']
-            db_table = descriptor_file_data['TargetInfo']['TableName']
+            db_table = descriptor_file_data['TargetInfo'].get('TableName')
             db_encoding = descriptor_file_data['TargetInfo'].get('DBEncoding', 'UTF-8')
         if 'SourceInfo' in descriptor_file_data:
             source_file = descriptor_file_data['SourceInfo']['Location']
@@ -103,6 +190,9 @@ def process_import(descriptor_file):
 
     connection = create_db_connection(db_host, db_port, db_user, db_pass, db_service, db_encoding)
     if args.bootstrap:
+        if not db_table:
+            logging.error('TargetInfo.TableName not provided in JSON descriptor file.')
+            return
         with open(args.bootstrap, 'r') as fp:
             try:
                 execute_sql(connection, "DROP TABLE %s.%s" % (db_schema, db_table))
@@ -111,23 +201,28 @@ def process_import(descriptor_file):
             for sql_command in fp.read().split(';'):
                 execute_sql(connection, sql_command)
     if args.selectall:
+        if not db_table:
+            logging.error('TargetInfo.TableName not provided in JSON descriptor file.')
+            return
         select_all(connection, db_table)
         return
 
     if args.executesql:
         logging.info("Running 'ExecuteSQL' method on %s" % descriptor_file)
         sorted_sql_statements = sorted(descriptor_file_data['SQLStatements'], key=lambda k: int(k.get('Order') or sys.maxsize))
-        for sql in sorted_sql_statements:
-            execute_sql(connection, sql['SQL'].rstrip(';'))
-
+        for sql in sorted_sql_statements[:-1]:
+            execute_sql(connection, sql['SQL'].rstrip(';'), commit=False, rollback_transaction=True)
+        execute_sql(connection, sorted_sql_statements[-1]['SQL'].rstrip(';'), commit=True, rollback_transaction=True)
         return
 
     sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
     header_values = None
+    regex_pattern = re.compile(r'''((?:[^%s"']|"[^"]*"|'[^']*')+)''' % source_delimeter)
     with open(os.path.join(os.path.dirname(__file__), source_file), 'r') as f:
         if source_fileheader:
             header_values = next(f)
-            header_values = header_values.strip().split(source_delimeter)
+            header_values = regex_pattern.split(header_values.strip())[1::2]
+            print(header_values)
         while True:
             bulk_row_insert = []
             lines = f.readlines(MAX_BYTES_PER_CHUNK)
@@ -135,8 +230,7 @@ def process_import(descriptor_file):
                 break
             logging.info("Reading %d bytes from input file - %d rows" % (MAX_BYTES_PER_CHUNK, len(lines)))
             for line in lines:
-                data = line.strip().split(source_delimeter)
-
+                data = regex_pattern.split(line.strip())[1::2]
                 bulk_row_insert.append(map_mapping_types(data, sorted_col_mappings, header=source_fileheader, header_values=header_values))
             logging.info('Bulk inserting %d rows' % len(bulk_row_insert))
             executemany_sql(connection, db_table, [x['Target'] for x in sorted_col_mappings], bulk_row_insert)
@@ -144,4 +238,4 @@ def process_import(descriptor_file):
 if __name__ == "__main__":
     for desc_file in glob.glob(args.json_file_path):
         logging.info("Processing %s" % desc_file)
-        process_import(desc_file)
+        process_descriptor_file(desc_file)

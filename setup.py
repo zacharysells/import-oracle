@@ -22,7 +22,8 @@ setuptools.setup(
         "aws-cdk.core==1.114.0",
         "aws_cdk.aws_ec2",
         "aws-cdk.aws-rds",
-        "cx_Oracle"
+        "cx_Oracle",
+        "xlsxwriter"
     ],
 
     python_requires=">=3.6",
