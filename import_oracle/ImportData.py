@@ -8,6 +8,9 @@ import argparse
 import datetime
 import cx_Oracle
 import xlsxwriter
+from xlsxwriter.utility import xl_rowcol_to_cell
+import openpyxl
+import tempfile
 
 parser = argparse.ArgumentParser()
 parser.add_argument("json_file_path", help="Relative path to file or file glob of json data import files")
@@ -51,9 +54,8 @@ def executemany_sql(connection, db_table, fields, rows, commit=True):
         raise e
 
 def execute_select_sql(connection, query):
+    logging.info('Executing SQL query="%s"' % query)
     curs = connection.cursor()
-    curs.prefetchrows = 1000
-    curs.arraysize = 1000
     curs.execute(query)
     return curs.fetchall()
 
@@ -71,6 +73,23 @@ def create_db_connection(db_host, db_port, db_user, db_pass, db_service, db_enco
     connection = cx_Oracle.connect(db_user, db_pass, dsn, encoding=db_encoding)
     return connection
 
+def convert_xlsx_to_csv(filename):
+    xlsx = openpyxl.load_workbook(filename)
+    sheet = xlsx.active
+    data = sheet.rows
+    csv_file = tempfile.mkstemp(suffix = '.csv')[1]
+    csv = open(csv_file, "w+")
+
+    for row in data:
+        l = list(row)
+        for i in range(len(l)):
+            if i == len(l) - 1:
+                csv.write(str(l[i].value))
+            else:
+                csv.write(str(l[i].value) + ',')
+        csv.write('\n')
+    return csv.name
+
 def map_mapping_types(row, mapping_list, header=True, header_values=None):
     row_string = ''
     for i, elem in enumerate(mapping_list):
@@ -86,7 +105,7 @@ def map_mapping_types(row, mapping_list, header=True, header_values=None):
                 source_column = i
             # Check for db_mapping parameter
             if elem.get('DB_CONVERSION'):
-                cell_value = elem['DB_CONVERSION'].replace('?', row[source_column])
+                cell_value = elem['DB_CONVERSION'].replace('?', row[source_column].replace("'", "''"))
                 row_string = row_string + (",%s" % cell_value)
             else:
                 cell_value = str(row[source_column]).replace("'", "''")
@@ -122,7 +141,6 @@ def process_export(descriptor_file):
             source_file = descriptor_file_data['TargetInfo']['FileName']
             date_format = descriptor_file_data['TargetInfo'].get('DateFmt', '{:%m/%d/%y %H:%M:%S}')
     connection = create_db_connection(db_host, db_port, db_user, db_pass, db_service, db_encoding)
-
     sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
     select_query = 'SELECT %s from %s' % (','.join([x['Source'] for x in sorted_col_mappings]), db_table)
     data = execute_select_sql(connection, select_query)
@@ -152,22 +170,28 @@ def process_export(descriptor_file):
         nrow += 1
 
     # Create Dropdown lists if needed
+    hidden_row_counter = 1
     for i, col_mapping in enumerate(sorted_col_mappings):
         if 'DDList' in col_mapping and col_mapping['DDList'].lower() in {'yes', 'true'}:
-            logging.info('Applying dropdown list validation on column "%s"' % col_mapping['Source'])
+            logging.info('Applying dropdown list validation on column "%s"' % (col_mapping['Source']))
             sql_query = 'SELECT DISTINCT %s from %s' % (col_mapping['Source'], db_table)
             unique_elements_in_column = execute_select_sql(connection, sql_query)
             unique_elements_in_column = sum([list(x) for x in unique_elements_in_column],[])
+
+            worksheet.write_row(xl_rowcol_to_cell(len(data) + hidden_row_counter, 0), unique_elements_in_column)
             worksheet.data_validation(1, i, 1048575, i, {
                 'validate': 'list',
-                'source': unique_elements_in_column
+                'source': '=%s:%s' % (xl_rowcol_to_cell(len(data) + hidden_row_counter, 0), xl_rowcol_to_cell(len(data) + hidden_row_counter, len(unique_elements_in_column)))
             })
+            worksheet.set_row(len(data) + hidden_row_counter, None, None, {'hidden': True})
+            hidden_row_counter += 1
+
     logging.info('Closing %s.' % os.path.join(source_location, source_file))
     workbook.close()
 
 
 def process_import(descriptor_file):
-    # descriptor_file arg should be a relative path to a .json 
+    # descriptor_file arg should be a relative path to a .json
     # file with all the required info to handle the data import.
     logging.info('Processing import for %s' % descriptor_file)
     with open(descriptor_file, 'r') as fp:
@@ -215,6 +239,12 @@ def process_import(descriptor_file):
         execute_sql(connection, sorted_sql_statements[-1]['SQL'].rstrip(';'), commit=True, rollback_transaction=True)
         return
 
+    import_file_path = os.path.join(os.path.dirname(__file__), source_file)
+    if source_filetype == 'xlsx':
+        logging.info('Converting %s to temporary csv' % import_file_path)
+        source_file = convert_xlsx_to_csv(import_file_path)
+        logging.info('Temporary csv created - %s' % source_file)
+
     sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
     header_values = None
     regex_pattern = re.compile(r'''((?:[^%s"']|"[^"]*"|'[^']*')+)''' % source_delimeter)
@@ -222,7 +252,6 @@ def process_import(descriptor_file):
         if source_fileheader:
             header_values = next(f)
             header_values = regex_pattern.split(header_values.strip())[1::2]
-            print(header_values)
         while True:
             bulk_row_insert = []
             lines = f.readlines(MAX_BYTES_PER_CHUNK)
