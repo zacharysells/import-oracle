@@ -54,15 +54,26 @@ def executemany_sql(connection, db_table, fields, rows, commit=True):
         raise e
 
 def execute_select_sql(connection, query):
+    """
+    This function will execute the provided `query` and return the results as a list of rows.
+    The first row in the results list will be the column names.
+    """
     logging.info('Executing SQL query="%s"' % query)
     curs = connection.cursor()
     curs.execute(query)
-    return curs.fetchall()
+    column_alias = [c[0] for c in curs.description]
+    rows = [list(c) for c in curs.fetchall()]
+    rows.insert(0, column_alias)
+    return rows
 
 def select_all(connection, db_table):
-    curs = connection.cursor()
-    curs.execute('SELECT * FROM %s' % db_table)
-    for row in curs.fetchall():
+    query = 'SELECT * FROM %s' % db_table
+    rows = execute_select_sql(connection, query)
+    headers = rows.pop(0)
+    for header in headers:
+        print('%s ' % str(header).ljust(2), end='')
+    print('-------------------------------------------------')
+    for row in rows:
         for elem in row:
             print('%s ' % str(elem).ljust(2), end='')
         print()
@@ -93,12 +104,12 @@ def convert_xlsx_to_csv(filename):
 def map_mapping_types(row, mapping_list, header=True, header_values=None):
     row_string = ''
     for i, elem in enumerate(mapping_list):
-        e = elem['Type']
+        e = elem.get('Type')
         if e.startswith('DBF-'):
             row_string = '%s,%s' % (row_string, e.replace('DBF-', ''))
         elif e.startswith('C-'):
             row_string = "%s,'%s'" % (row_string, e.replace('C-', ''))
-        elif e == 'S':
+        else: # Default to 'S' column type.
             if header:
                 source_column = int(header_values.index(elem['Source']))
             else:
@@ -110,9 +121,6 @@ def map_mapping_types(row, mapping_list, header=True, header_values=None):
             else:
                 cell_value = str(row[source_column]).replace("'", "''")
                 row_string = row_string + (",'%s'" % cell_value)
-        else:
-            logging.fatal("Unknown type %s in Column Mappings" % e)
-            sys.exit(1)
     return row_string.lstrip(',')
 
 def process_descriptor_file(descriptor_file):
@@ -134,7 +142,7 @@ def process_export(descriptor_file):
             db_service = descriptor_file_data['SourceInfo']['DBService']
             db_user = descriptor_file_data['SourceInfo']['UserName']
             db_pass = descriptor_file_data['SourceInfo']['PassWord']
-            db_table = descriptor_file_data['SourceInfo'].get('TableName')
+            db_sql_query = descriptor_file_data['SourceInfo']['SQL']
             db_encoding = descriptor_file_data['SourceInfo'].get('DBEncoding', 'UTF-8')
         if 'TargetInfo' in descriptor_file_data:
             source_location = descriptor_file_data['TargetInfo']['Location']
@@ -142,9 +150,8 @@ def process_export(descriptor_file):
             date_format = descriptor_file_data['TargetInfo'].get('DateFmt', '{:%m/%d/%y %H:%M:%S}')
     connection = create_db_connection(db_host, db_port, db_user, db_pass, db_service, db_encoding)
     sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
-    select_query = 'SELECT %s from %s' % (','.join([x['Source'] for x in sorted_col_mappings]), db_table)
-    data = execute_select_sql(connection, select_query)
 
+    data = execute_select_sql(connection, db_sql_query.replace('~', '"'))
     logging.info('Opening %s for writing' % os.path.join(source_location, source_file))
     workbook = xlsxwriter.Workbook(os.path.join(source_location, source_file))
     worksheet = workbook.add_worksheet()
@@ -156,11 +163,11 @@ def process_export(descriptor_file):
         'valign': 'vcenter',
         'indent': 1,
     })
-    headers = [x['Target'] for x in sorted_col_mappings]
+    headers = data.pop(0)
     worksheet.write_row('A1', headers, header_format)
     nrow = 1 # Start at one, skip header row
     for row in data:
-        logging.debug('Inserting row %s into spreadsheet' % list(row))
+        logging.debug('Inserting row %s into spreadsheet' % row)
         ncolumn = 0
         for item in row:
             if isinstance(item, datetime.datetime):
@@ -171,17 +178,17 @@ def process_export(descriptor_file):
 
     # Create Dropdown lists if needed
     hidden_row_counter = 1
-    for i, col_mapping in enumerate(sorted_col_mappings):
+    for col_mapping in sorted_col_mappings:
         if 'DDList' in col_mapping and col_mapping['DDList'].lower() in {'yes', 'true'}:
             logging.info('Applying dropdown list validation on column "%s"' % (col_mapping['Source']))
-            sql_query = 'SELECT DISTINCT %s from %s' % (col_mapping['Source'], db_table)
-            unique_elements_in_column = execute_select_sql(connection, sql_query)
-            unique_elements_in_column = sum([list(x) for x in unique_elements_in_column],[])
+            unique_elements_in_column = execute_select_sql(connection, col_mapping['DDListSQL'])[1:] # Skipping header row with [1:]
+            unique_elements_in_column = sum([x for x in unique_elements_in_column],[])
+            column_index = headers.index(col_mapping['Target'])
 
             worksheet.write_row(xl_rowcol_to_cell(len(data) + hidden_row_counter, 0), unique_elements_in_column)
-            worksheet.data_validation(1, i, 1048575, i, {
+            worksheet.data_validation(1, column_index, 1048575, column_index, {
                 'validate': 'list',
-                'source': '=%s:%s' % (xl_rowcol_to_cell(len(data) + hidden_row_counter, 0), xl_rowcol_to_cell(len(data) + hidden_row_counter, len(unique_elements_in_column)))
+                'source': '=%s:%s' % (xl_rowcol_to_cell(len(data) + hidden_row_counter, 0, row_abs=True, col_abs=True), xl_rowcol_to_cell(len(data) + hidden_row_counter, len(unique_elements_in_column), row_abs=True, col_abs=True))
             })
             worksheet.set_row(len(data) + hidden_row_counter, None, None, {'hidden': True})
             hidden_row_counter += 1
