@@ -25,6 +25,10 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+date_strftime_fmt = '%m/%d/%Y %H:%M:%S'
+oracle_strftime_fmt = 'MM/DD/YY HH24:MI:SS'
+script_execution_time = datetime.datetime.now().strftime(date_strftime_fmt)
+
 def execute_sql(connection, query, commit=True, rollback_transaction=False):
     logging.info('Executing SQL query="%s"' % query)
     curs = connection.cursor()
@@ -91,13 +95,19 @@ def convert_xlsx_to_csv(filename):
     csv_file = tempfile.mkstemp(suffix = '.csv')[1]
     csv = open(csv_file, "w+")
 
-    for row in data:
+    for i, row in enumerate(data):
+        if sheet.row_dimensions[i+1].hidden:
+            continue
+
         l = list(row)
         for i in range(len(l)):
+            cell_value = str(l[i].value) if str(l[i].value) != 'None' else ' '
+            if ',' in cell_value:
+                cell_value = '"%s"' % cell_value
             if i == len(l) - 1:
-                csv.write(str(l[i].value))
+                csv.write(cell_value)
             else:
-                csv.write(str(l[i].value) + ',')
+                csv.write(cell_value + ',')
         csv.write('\n')
     return csv.name
 
@@ -109,6 +119,8 @@ def map_mapping_types(row, mapping_list, header=True, header_values=None):
             row_string = '%s,%s' % (row_string, e.replace('DBF-', ''))
         elif e.startswith('C-'):
             row_string = "%s,'%s'" % (row_string, e.replace('C-', ''))
+        elif e == 'S-datetime.now()':
+            row_string = "%s,TO_DATE('%s', '%s')" % (row_string, script_execution_time, oracle_strftime_fmt)
         else: # Default to 'S' column type.
             if header:
                 source_column = int(header_values.index(elem['Source']))
@@ -214,7 +226,7 @@ def process_import(descriptor_file):
             db_encoding = descriptor_file_data['TargetInfo'].get('DBEncoding', 'UTF-8')
         if 'SourceInfo' in descriptor_file_data:
             source_file = descriptor_file_data['SourceInfo']['Location']
-            source_delimeter = descriptor_file_data['SourceInfo']['Delimiter']
+            source_delimeter = descriptor_file_data['SourceInfo'].get('Delimiter', ',')
             source_filetype = descriptor_file_data['SourceInfo']['FileType']
             source_fileheader = True if descriptor_file_data['SourceInfo']['FileHeader'].lower() == 'yes' else False
             MAX_BYTES_PER_CHUNK = descriptor_file_data['MaxBytesPerChunk']
@@ -254,11 +266,12 @@ def process_import(descriptor_file):
 
     sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
     header_values = None
-    regex_pattern = re.compile(r'''((?:[^%s"']|"[^"]*"|'[^']*')+)''' % source_delimeter)
+    regex_pattern = re.compile(r'''((?:[^%s"]|"[^"]*"|'[^']*')+)''' % source_delimeter)
     with open(os.path.join(os.path.dirname(__file__), source_file), 'r') as f:
         if source_fileheader:
             header_values = next(f)
             header_values = regex_pattern.split(header_values.strip())[1::2]
+            header_values = ['' if i == ' ' else i for i in header_values]
         while True:
             bulk_row_insert = []
             lines = f.readlines(MAX_BYTES_PER_CHUNK)
@@ -267,6 +280,7 @@ def process_import(descriptor_file):
             logging.info("Reading %d bytes from input file - %d rows" % (MAX_BYTES_PER_CHUNK, len(lines)))
             for line in lines:
                 data = regex_pattern.split(line.strip())[1::2]
+                data = ['' if i == ' ' else i for i in data]
                 bulk_row_insert.append(map_mapping_types(data, sorted_col_mappings, header=source_fileheader, header_values=header_values))
             logging.info('Bulk inserting %d rows' % len(bulk_row_insert))
             executemany_sql(connection, db_table, [x['Target'] for x in sorted_col_mappings], bulk_row_insert)
