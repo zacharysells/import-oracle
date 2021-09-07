@@ -20,30 +20,43 @@ parser.add_argument("--bootstrap", help="Bootstrap db with provided .sql file. W
 parser.add_argument("--loglevel", help="Log level. Allowed values are [DEBUG, INFO, WARN, ERROR]. Defaults to INFO", default="INFO")
 args = parser.parse_args()
 
+
 loglevel_mapping = {
     'DEBUG': logging.DEBUG,
     'INFO': logging.INFO,
     'WARN': logging.WARN,
     'ERROR': logging.ERROR
 }
+log_format = "%(asctime)s %(levelname)-8s %(message)s"
 logging.basicConfig(
-    format='%(asctime)s %(levelname)-8s %(message)s',
+    format=log_format,
     level=loglevel_mapping[args.loglevel],
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+logs = logging.getLogger(__name__)
 date_strftime_fmt = '%m/%d/%Y %H:%M:%S'
 oracle_strftime_fmt = 'MM/DD/YY HH24:MI:SS'
-script_execution_time = datetime.datetime.now().strftime(date_strftime_fmt)
+script_execution_time = datetime.datetime.now()
+script_execution_time_str = script_execution_time.strftime(date_strftime_fmt)
+
+def set_error_log_handler(filename="error"):
+    global logs
+    logs.info('Setting error log handler - %s.log' % filename)
+    err_file = logging.FileHandler('%s.log' % filename, delay=True)
+    err_file.setLevel(logging.ERROR)
+    err_file.setFormatter(logging.Formatter(log_format))
+    logs.handlers = []
+    logs.addHandler(err_file)
 
 def execute_sql(connection, query, commit=True, rollback_transaction=False):
-    logging.debug('Executing SQL query="%s"' % query)
+    logs.debug('Executing SQL query="%s"' % query)
     curs = connection.cursor()
     try:
         curs.execute(query)
     except Exception as e:
         if rollback_transaction:
-            logging.error('Failed query. Rolling back transactions.')
+            logs.error('Failed query. Rolling back transactions.')
             connection.rollback()
         raise e
     if commit:
@@ -53,14 +66,14 @@ def execute_sql(connection, query, commit=True, rollback_transaction=False):
 def executemany_sql(connection, db_table, fields, rows, commit=True):
     inserts = '\n'.join(['into %s(%s) values(%s)' % (db_table, ','.join(fields), row) for row in rows])
     sql_query = """insert all %s SELECT * FROM dual""" % inserts
-    logging.debug('Bulk SQL query="%s"' % sql_query)
+    logs.debug('Bulk SQL query="%s"' % sql_query)
     try:
         curs = connection.cursor()
         curs.execute(sql_query)
         connection.commit()
     except cx_Oracle.DatabaseError as e:
         errorObj, = e.args
-        logging.error("Row %d has error %s" % (curs.rowcount, errorObj.message))
+        logs.error("Row %d has error %s" % (curs.rowcount, errorObj.message))
         raise e
 
 def execute_select_sql(connection, query):
@@ -68,7 +81,7 @@ def execute_select_sql(connection, query):
     This function will execute the provided `query` and return the results as a list of rows.
     The first row in the results list will be the column names.
     """
-    logging.debug('Executing SQL query="%s"' % query)
+    logs.debug('Executing SQL query="%s"' % query)
     curs = connection.cursor()
     curs.execute(query)
     column_alias = [c[0] for c in curs.description]
@@ -89,7 +102,7 @@ def select_all(connection, db_table):
         print()
 
 def create_db_connection(db_host, db_port, db_user, db_pass, db_service, db_encoding):
-    logging.info("Connecting to database %s@%s" % (db_user, db_host))
+    logs.info("Connecting to database %s@%s" % (db_user, db_host))
     dsn = cx_Oracle.makedsn(db_host, db_port, service_name=db_service)
     connection = cx_Oracle.connect(db_user, db_pass, dsn, encoding=db_encoding)
     return connection
@@ -98,7 +111,8 @@ def convert_xlsx_to_csv(filename):
     xlsx = openpyxl.load_workbook(filename)
     sheet = xlsx.active
     data = sheet.rows
-    csv_file = tempfile.mkstemp(suffix = '.csv')[1]
+    temp_dir = tempfile.mkdtemp()
+    csv_file = os.path.join(temp_dir, "%s.csv" % os.path.basename(filename).split('.')[0])
     csv = open(csv_file, "w+")
 
     for i, row in enumerate(data):
@@ -127,7 +141,7 @@ def map_mapping_types(row, mapping_list, row_num=None, source_filename=None, hea
         elif e.startswith('C-'):
             row_string = "%s,'%s'" % (row_string, e.replace('C-', ''))
         elif e == 'S-datetime.now()':
-            row_string = "%s,TO_DATE('%s', '%s')" % (row_string, script_execution_time, oracle_strftime_fmt)
+            row_string = "%s,TO_DATE('%s', '%s')" % (row_string, script_execution_time_str, oracle_strftime_fmt)
         elif e.startswith('S-FILENAME'):
             _, i, e = tuple(e.split('.'))
             value = os.path.basename(source_filename)[int(i)-1:int(e)]
@@ -157,7 +171,7 @@ def process_descriptor_file(descriptor_file):
             process_import(descriptor_file)
 
 def process_export(descriptor_file):
-    logging.info('Processing export for %s' % descriptor_file)
+    logs.info('Processing export for %s' % descriptor_file)
     with open(descriptor_file, 'r') as fp:
         descriptor_file_data = json.load(fp)
         if 'SourceInfo' in descriptor_file_data:
@@ -177,7 +191,7 @@ def process_export(descriptor_file):
     sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
 
     data = execute_select_sql(connection, db_sql_query.replace('~', '"'))
-    logging.info('Opening %s for writing' % os.path.join(source_location, source_file))
+    logs.info('Opening %s for writing' % os.path.join(source_location, source_file))
     workbook = xlsxwriter.Workbook(os.path.join(source_location, source_file))
     worksheet = workbook.add_worksheet()
     header_format = workbook.add_format({
@@ -192,7 +206,7 @@ def process_export(descriptor_file):
     worksheet.write_row('A1', headers, header_format)
     nrow = 1 # Start at one, skip header row
     for row in data:
-        logging.debug('Inserting row %s into spreadsheet' % row)
+        logs.debug('Inserting row %s into spreadsheet' % row)
         ncolumn = 0
         for item in row:
             if isinstance(item, datetime.datetime):
@@ -205,7 +219,7 @@ def process_export(descriptor_file):
     hidden_row_counter = 1
     for col_mapping in sorted_col_mappings:
         if 'DDList' in col_mapping and col_mapping['DDList'].lower() in {'yes', 'true'}:
-            logging.info('Applying dropdown list validation on column "%s"' % (col_mapping['Source']))
+            logs.info('Applying dropdown list validation on column "%s"' % (col_mapping['Source']))
             unique_elements_in_column = execute_select_sql(connection, col_mapping['DDListSQL'])[1:] # Skipping header row with [1:]
             unique_elements_in_column = sum([x for x in unique_elements_in_column],[])
             column_index = headers.index(col_mapping['Target'])
@@ -218,14 +232,14 @@ def process_export(descriptor_file):
             worksheet.set_row(len(data) + hidden_row_counter, None, None, {'hidden': True})
             hidden_row_counter += 1
 
-    logging.info('Closing %s.' % os.path.join(source_location, source_file))
+    logs.info('Closing %s.' % os.path.join(source_location, source_file))
     workbook.close()
 
 
 def process_import(descriptor_file):
     # descriptor_file arg should be a relative path to a .json
     # file with all the required info to handle the data import.
-    logging.info('Processing import for %s' % descriptor_file)
+    logs.info('Processing import for %s' % descriptor_file)
     with open(descriptor_file, 'r') as fp:
         descriptor_file_data = json.load(fp)
         if 'TargetInfo' in descriptor_file_data:
@@ -247,7 +261,7 @@ def process_import(descriptor_file):
     connection = create_db_connection(db_host, db_port, db_user, db_pass, db_service, db_encoding)
     if args.bootstrap:
         if not db_table:
-            logging.error('TargetInfo.TableName not provided in JSON descriptor file.')
+            logs.error('TargetInfo.TableName not provided in JSON descriptor file.')
             return
         with open(args.bootstrap, 'r') as fp:
             try:
@@ -258,13 +272,17 @@ def process_import(descriptor_file):
                 execute_sql(connection, sql_command)
     if args.selectall:
         if not db_table:
-            logging.error('TargetInfo.TableName not provided in JSON descriptor file.')
+            logs.error('TargetInfo.TableName not provided in JSON descriptor file.')
             return
         select_all(connection, db_table)
         return
 
     if args.executesql:
-        logging.info("Running 'ExecuteSQL' method on %s" % descriptor_file)
+        logs.info("Running 'ExecuteSQL' method on %s" % descriptor_file)
+        set_error_log_handler('{filename}-{date:%Y-%m-%d_%H-%M-%S}'.format(
+            filename='executesql-errors',
+            date=script_execution_time
+        ))
         sorted_sql_statements = sorted(descriptor_file_data['SQLStatements'], key=lambda k: int(k.get('Order') or sys.maxsize))
         for sql in sorted_sql_statements[:-1]:
             execute_sql(connection, sql['SQL'].rstrip(';'), commit=False, rollback_transaction=True)
@@ -273,12 +291,15 @@ def process_import(descriptor_file):
 
     import_file_path = os.path.join(os.path.dirname(__file__), source_file)
     for import_file in glob.glob(import_file_path):
-        logging.info("Processing %s" % import_file)
-
+        logs.info("Processing %s" % import_file)
+        set_error_log_handler('{filename}-{date:%Y-%m-%d_%H-%M-%S}'.format(
+            filename=os.path.basename(import_file).split('.')[0],
+            date=script_execution_time
+        ))
         if source_filetype == 'xlsx':
-            logging.info('Converting %s to temporary csv' % import_file)
-            source_file = convert_xlsx_to_csv(import_file)
-            logging.info('Temporary csv created - %s' % source_file)
+            logs.info('Converting %s to temporary csv' % import_file)
+            import_file = convert_xlsx_to_csv(import_file)
+            logs.info('Temporary csv created - %s' % import_file)
 
         sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
         header_values = None
@@ -295,13 +316,13 @@ def process_import(descriptor_file):
                 lines = f.readlines(MAX_BYTES_PER_CHUNK)
                 if not lines:
                     break
-                logging.info("Reading %d bytes from input file - %d row(s)" % (MAX_BYTES_PER_CHUNK, len(lines)))
+                logs.info("Reading %d bytes from input file - %d row(s)" % (MAX_BYTES_PER_CHUNK, len(lines)))
                 for line in lines:
                     data = regex_pattern.split(line.strip())
                     data = ['' if i == ' ' else i for i in data]
-                    bulk_row_insert.append(map_mapping_types(data, sorted_col_mappings, row_num=row_counter, source_filename=source_file, header=source_fileheader, header_values=header_values))
+                    bulk_row_insert.append(map_mapping_types(data, sorted_col_mappings, row_num=row_counter, source_filename=import_file, header=source_fileheader, header_values=header_values))
                     row_counter += 1
-                logging.info('Bulk inserting rows %d-%d' % (row_counter_start, row_counter-1))
+                logs.info('Bulk inserting rows %d-%d' % (row_counter_start, row_counter-1))
                 try:
                     executemany_sql(connection, db_table, [x['Target'] for x in sorted_col_mappings], bulk_row_insert)
                 except cx_Oracle.DatabaseError as e:
