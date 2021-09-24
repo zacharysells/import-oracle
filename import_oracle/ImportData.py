@@ -6,6 +6,7 @@ import re
 import os
 import argparse
 import datetime
+from string import ascii_uppercase
 import cx_Oracle
 import xlsxwriter
 from xlsxwriter.utility import xl_rowcol_to_cell
@@ -183,6 +184,7 @@ def process_export(descriptor_file):
             db_pass = descriptor_file_data['SourceInfo']['PassWord']
             db_sql_query = descriptor_file_data['SourceInfo']['SQL']
             db_encoding = descriptor_file_data['SourceInfo'].get('DBEncoding', 'UTF-8')
+            db_filename_prefix_col = descriptor_file_data['SourceInfo'].get('FileNamePrefixColName')
         if 'TargetInfo' in descriptor_file_data:
             source_location = descriptor_file_data['TargetInfo']['Location']
             source_file = descriptor_file_data['TargetInfo']['FileName']
@@ -191,49 +193,88 @@ def process_export(descriptor_file):
     sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
 
     data = execute_select_sql(connection, db_sql_query.replace('~', '"'))
-    logs.info('Opening %s for writing' % os.path.join(source_location, source_file))
-    workbook = xlsxwriter.Workbook(os.path.join(source_location, source_file))
-    worksheet = workbook.add_worksheet()
-    header_format = workbook.add_format({
-        'border': 1,
-        'bg_color': '#C6EFCE',
-        'bold': True,
-        'text_wrap': True,
-        'valign': 'vcenter',
-        'indent': 1,
-    })
     headers = data.pop(0)
-    worksheet.write_row('A1', headers, header_format)
-    nrow = 1 # Start at one, skip header row
-    for row in data:
-        logs.debug('Inserting row %s into spreadsheet' % row)
-        ncolumn = 0
-        for item in row:
-            if isinstance(item, datetime.datetime):
-                item = date_format.format(item)
-            worksheet.write(nrow, ncolumn, item)
-            ncolumn += 1
-        nrow += 1
 
-    # Create Dropdown lists if needed
-    hidden_row_counter = 1
-    for col_mapping in sorted_col_mappings:
-        if 'DDList' in col_mapping and col_mapping['DDList'].lower() in {'yes', 'true'}:
-            logs.info('Applying dropdown list validation on column "%s"' % (col_mapping['Source']))
-            unique_elements_in_column = execute_select_sql(connection, col_mapping['DDListSQL'])[1:] # Skipping header row with [1:]
-            unique_elements_in_column = sum([x for x in unique_elements_in_column],[])
-            column_index = headers.index(col_mapping['Target'])
+    file_prefixes_unique = [''] # Single element as empty string so the for-loop will process once with no prefix
+    if db_filename_prefix_col:
+        filename_prefix_index = headers.index(db_filename_prefix_col)
+        used=set()
+        file_prefixes = [row[filename_prefix_index] for row in data if row]
+        file_prefixes_unique = [x for x in file_prefixes if x not in used and (used.add(x) or True)]
 
-            worksheet.write_row(xl_rowcol_to_cell(len(data) + hidden_row_counter, 0), unique_elements_in_column)
-            worksheet.data_validation(1, column_index, 1048575, column_index, {
-                'validate': 'list',
-                'source': '=%s:%s' % (xl_rowcol_to_cell(len(data) + hidden_row_counter, 0, row_abs=True, col_abs=True), xl_rowcol_to_cell(len(data) + hidden_row_counter, len(unique_elements_in_column), row_abs=True, col_abs=True))
-            })
-            worksheet.set_row(len(data) + hidden_row_counter, None, None, {'hidden': True})
-            hidden_row_counter += 1
+    logs.debug('File prefixes determined: %s' % file_prefixes_unique)
+    workbooks = []
+    for file_prefix in file_prefixes_unique:
+        if db_filename_prefix_col:
+            workbook_name = '%s-%s' % (file_prefix, source_file)
+        else:
+            workbook_name = source_file
+        logs.info('Opening %s for writing' % os.path.join(source_location, workbook_name))
+        workbook = xlsxwriter.Workbook(os.path.join(source_location, workbook_name))
+        workbooks.append({
+            'workbook': workbook,
+            'name': os.path.join(source_location, workbook_name),
+            'prefix': file_prefix
+        })
+        worksheet = workbook.add_worksheet()
+        header_format = workbook.add_format({
+            'border': 1,
+            'bg_color': '#C6EFCE',
+            'bold': True,
+            'text_wrap': True,
+            'valign': 'vcenter',
+            'indent': 1,
+        })
+        # Set column width based on header size
+        worksheet.write_row('A1', headers, header_format)
+        for i in range(len(headers)):
+            worksheet.set_column(i, i, len(headers[i]) + 5)
 
-    logs.info('Closing %s.' % os.path.join(source_location, source_file))
-    workbook.close()
+        nrow = 1 # Start at one, skip header row
+        for row in data:
+            if db_filename_prefix_col and (row[filename_prefix_index] != file_prefix):
+                # Move on to next file prefix
+                continue
+            logs.debug('Inserting row %s into spreadsheet' % row)
+            ncolumn = 0
+            for item in row:
+                if isinstance(item, datetime.datetime):
+                    item = date_format.format(item)
+                worksheet.write(nrow, ncolumn, item)
+                ncolumn += 1
+            nrow += 1
+
+        # Hide filename prefix column - if any
+        if db_filename_prefix_col:
+            worksheet.set_column(headers.index(db_filename_prefix_col), headers.index(db_filename_prefix_col), None, None, {'hidden': True})
+
+    # Iterate through all workbooks. Create Dropdown lists if needed.
+    for workbook in workbooks:
+        prefix = workbook['prefix']
+        name = workbook['name']
+        workbook = workbook['workbook']
+        hidden_row_counter = 1
+        worksheet = workbook.worksheets()[0]
+        for col_mapping in sorted_col_mappings:
+            if 'DDList' in col_mapping and col_mapping['DDList'].lower() in {'yes', 'true'}:
+                logs.info('Applying dropdown list validation on column "%s" in workbook %s' % (col_mapping['Source'], name))
+                ddlist_query = col_mapping['DDListSQL']
+                if '^' in ddlist_query:
+                    ddlist_query = ddlist_query.replace('^', "WHERE %s = '%s'" % (db_filename_prefix_col, prefix))
+                unique_elements_in_column = execute_select_sql(connection, ddlist_query)[1:] # Skipping header row with [1:]
+                unique_elements_in_column = sum([x for x in unique_elements_in_column],[])
+                column_index = headers.index(col_mapping['Target'])
+
+                worksheet.write_row(xl_rowcol_to_cell(len(data) + hidden_row_counter, 0), unique_elements_in_column)
+                worksheet.data_validation(1, column_index, 1048575, column_index, {
+                    'validate': 'list',
+                    'source': '=%s:%s' % (xl_rowcol_to_cell(len(data) + hidden_row_counter, 0, row_abs=True, col_abs=True), xl_rowcol_to_cell(len(data) + hidden_row_counter, len(unique_elements_in_column), row_abs=True, col_abs=True))
+                })
+                worksheet.set_row(len(data) + hidden_row_counter, None, None, {'hidden': True})
+                hidden_row_counter += 1
+
+        logs.info('Closing %s.' % os.path.join(source_location, source_file))
+        workbook.close()
 
 
 def process_import(descriptor_file):
@@ -283,7 +324,18 @@ def process_import(descriptor_file):
             filename='executesql-errors',
             date=script_execution_time
         ))
-        sorted_sql_statements = sorted(descriptor_file_data['SQLStatements'], key=lambda k: int(k.get('Order') or sys.maxsize))
+        sorted_sql_statements = []
+        if descriptor_file_data.get('SQLSource', 'inline').lower() == 'file':
+            sql_source_file = os.path.join(os.path.dirname(__file__), descriptor_file_data['SQLSourceFile'])
+            logs.info("Processing SQLSourceFile %s" % sql_source_file)
+            with open(sql_source_file, 'r') as fp:
+                for sql in fp.read().split(';'):
+                    sorted_sql_statements.append({
+                        'SQL': sql.strip('\n')
+                    })
+        else:
+            # Get SQL from JSON file
+            sorted_sql_statements = sorted(descriptor_file_data['SQLStatements'], key=lambda k: int(k.get('Order') or sys.maxsize))
         for sql in sorted_sql_statements[:-1]:
             execute_sql(connection, sql['SQL'].rstrip(';'), commit=False, rollback_transaction=True)
         execute_sql(connection, sorted_sql_statements[-1]['SQL'].rstrip(';'), commit=True, rollback_transaction=True)
