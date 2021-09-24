@@ -61,6 +61,7 @@ def execute_sql(connection, query, commit=True, rollback_transaction=False):
             connection.rollback()
         raise e
     if commit:
+        logs.debug('Committing SQL Transaction.')
         connection.commit()
     pass
 
@@ -324,21 +325,20 @@ def process_import(descriptor_file):
             filename='executesql-errors',
             date=script_execution_time
         ))
-        sorted_sql_statements = []
-        if descriptor_file_data.get('SQLSource', 'inline').lower() == 'file':
-            sql_source_file = os.path.join(os.path.dirname(__file__), descriptor_file_data['SQLSourceFile'])
-            logs.info("Processing SQLSourceFile %s" % sql_source_file)
-            with open(sql_source_file, 'r') as fp:
-                for sql in fp.read().split(';'):
-                    sorted_sql_statements.append({
-                        'SQL': sql.strip('\n')
-                    })
-        else:
-            # Get SQL from JSON file
-            sorted_sql_statements = sorted(descriptor_file_data['SQLStatements'], key=lambda k: int(k.get('Order') or sys.maxsize))
-        for sql in sorted_sql_statements[:-1]:
-            execute_sql(connection, sql['SQL'].rstrip(';'), commit=False, rollback_transaction=True)
-        execute_sql(connection, sorted_sql_statements[-1]['SQL'].rstrip(';'), commit=True, rollback_transaction=True)
+        sorted_sql_statements = sorted(descriptor_file_data['SQLStatements'], key=lambda k: int(k.get('Order') or sys.maxsize))
+        for sql in sorted_sql_statements:
+            commit = sql is sorted_sql_statements[-1]
+            if sql.get('SQLSource', 'inline').lower() == 'inline':
+                execute_sql(connection, sql['SQL'].rstrip(';'), commit=commit, rollback_transaction=True)
+            else:
+                sql_source_file = os.path.join(os.path.dirname(__file__), sql['SQLSourceFile'])
+                logs.info("Processing SQLSourceFile %s" % sql_source_file)
+                with open(sql_source_file, 'r') as fp:
+                    file_sql_statements = fp.read().split(';')
+                    for sql in file_sql_statements:
+                        commit = sql is file_sql_statements[-1]
+                        if sql:
+                            execute_sql(connection, sql.strip('\n'), commit=commit, rollback_transaction=True)
         return
 
     import_file_path = os.path.join(os.path.dirname(__file__), source_file)
