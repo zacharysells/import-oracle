@@ -335,10 +335,15 @@ def process_import(descriptor_file):
                 logs.info("Processing SQLSourceFile %s" % sql_source_file)
                 with open(sql_source_file, 'r') as fp:
                     file_sql_statements = fp.read().split(';')
+
+                    # If the sql file ends in a ';' we will end up with an empty string SQL query so we're removing that here
+                    try:
+                        file_sql_statements.remove('')
+                    except ValueError:
+                        pass
                     for sql in file_sql_statements:
                         commit = sql is file_sql_statements[-1]
-                        if sql:
-                            execute_sql(connection, sql.strip('\n'), commit=commit, rollback_transaction=True)
+                        execute_sql(connection, sql.strip('\n'), commit=commit, rollback_transaction=True)
         return
 
     import_file_path = os.path.join(os.path.dirname(__file__), source_file)
