@@ -137,31 +137,36 @@ def map_mapping_types(row, mapping_list, row_num=None, source_filename=None, hea
     row += [''] * (len(header_values) - len(row))
     row_string = ''
     for i, elem in enumerate(mapping_list):
+        quoted = True
         e = elem.get('Type')
         if e.startswith('DBF-'):
-            row_string = '%s,%s' % (row_string, e.replace('DBF-', ''))
+            cell_value = e.replace('DBF-', '')
+            quoted = False
         elif e.startswith('C-'):
-            row_string = "%s,'%s'" % (row_string, e.replace('C-', ''))
+            cell_value = e.replace('C-', '')
         elif e == 'S-datetime.now()':
-            row_string = "%s,TO_DATE('%s', '%s')" % (row_string, script_execution_time_str, oracle_strftime_fmt)
+            cell_value = "TO_DATE('%s', '%s')" % (script_execution_time_str, oracle_strftime_fmt)
+            quoted = False
         elif e.startswith('S-FILENAME'):
             _, i, e = tuple(e.split('.'))
-            value = os.path.basename(source_filename)[int(i)-1:int(e)]
-            row_string = "%s,'%s'" % (row_string, value)
+            cell_value = os.path.basename(source_filename)[int(i)-1:int(e)]
         elif e == 'S-ROWNUM':
-            row_string = "%s,'%s'" % (row_string, row_num)
+            cell_value = row_num
         else: # Default to 'S' column type.
             if header:
                 source_column = int(header_values.index(elem['Source']))
             else:
                 source_column = i
-            # Check for db_mapping parameter
-            if elem.get('DB_CONVERSION'):
-                cell_value = elem['DB_CONVERSION'].replace('?', row[source_column].replace("'", "''"))
-                row_string = row_string + (",%s" % cell_value)
-            else:
-                cell_value = str(row[source_column]).replace("'", "''")
-                row_string = row_string + (",'%s'" % cell_value)
+            cell_value = str(row[source_column]).replace("'", "''")
+
+        # Check for db_mapping parameter
+        if elem.get('DB_CONVERSION'):
+            cell_value = elem['DB_CONVERSION'].replace('?', cell_value)
+            quoted=False
+        if quoted:
+            row_string = "%s,'%s'" % (row_string, cell_value)
+        else:
+            row_string = "%s,%s" % (row_string, cell_value)
     return row_string.lstrip(',')
 
 def process_descriptor_file(descriptor_file):
@@ -190,6 +195,7 @@ def process_export(descriptor_file):
             source_location = descriptor_file_data['TargetInfo']['Location']
             source_file = descriptor_file_data['TargetInfo']['FileName']
             date_format = descriptor_file_data['TargetInfo'].get('DateFmt', '{:%m/%d/%y %H:%M:%S}')
+            unlocked_columns = descriptor_file_data['TargetInfo'].get('UnlockedColumns', [])
     connection = create_db_connection(db_host, db_port, db_user, db_pass, db_service, db_encoding)
     sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
 
@@ -212,20 +218,27 @@ def process_export(descriptor_file):
             workbook_name = source_file
         logs.info('Opening %s for writing' % os.path.join(source_location, workbook_name))
         workbook = xlsxwriter.Workbook(os.path.join(source_location, workbook_name))
+        locked = workbook.add_format()
+        locked.set_locked(True)
+
+        unlocked = workbook.add_format()
+        unlocked.set_locked(False)
         workbooks.append({
             'workbook': workbook,
             'name': os.path.join(source_location, workbook_name),
             'prefix': file_prefix
         })
         worksheet = workbook.add_worksheet()
+        worksheet.protect()
         header_format = workbook.add_format({
             'border': 1,
             'bg_color': '#C6EFCE',
             'bold': True,
             'text_wrap': True,
             'valign': 'vcenter',
-            'indent': 1,
+            'indent': 1
         })
+        header_format.set_locked(False)
         # Set column width based on header size
         worksheet.write_row('A1', headers, header_format)
         for i in range(len(headers)):
@@ -241,7 +254,12 @@ def process_export(descriptor_file):
             for item in row:
                 if isinstance(item, datetime.datetime):
                     item = date_format.format(item)
-                worksheet.write(nrow, ncolumn, item)
+                if headers[ncolumn] in unlocked_columns:
+                    logs.debug('Writing unlocked cell in column %d[%s]' % (ncolumn, headers[ncolumn]))
+                    worksheet.write(nrow, ncolumn, item, unlocked)
+                else:
+                    logs.debug('Writing locked cell in column %d[%s]' % (ncolumn, headers[ncolumn]))
+                    worksheet.write(nrow, ncolumn, item, locked)
                 ncolumn += 1
             nrow += 1
 
