@@ -19,6 +19,7 @@ parser.add_argument("--executesql", help="`json_file_path` arg will be parsed as
 parser.add_argument("--selectall", help="Print all rows in table", action="store_true")
 parser.add_argument("--bootstrap", help="Bootstrap db with provided .sql file. WARNING this will drop the table first.")
 parser.add_argument("--loglevel", help="Log level. Allowed values are [DEBUG, INFO, WARN, ERROR]. Defaults to INFO", default="INFO")
+parser.add_argument("--locked", help="Boolean parameter, when set to true the resulting columns will default to locked. This parameter is only used for exports", action="store_true", default=False)
 args = parser.parse_args()
 
 
@@ -198,6 +199,7 @@ def process_export(descriptor_file):
             unlocked_columns = descriptor_file_data['TargetInfo'].get('UnlockedColumns', [])
     connection = create_db_connection(db_host, db_port, db_user, db_pass, db_service, db_encoding)
     sorted_col_mappings = sorted(descriptor_file_data['ColMappings'], key=lambda k: int(k.get('Order') or sys.maxsize))
+    hidden_columns = descriptor_file_data.get('HideColumns', [])
 
     data = execute_select_sql(connection, db_sql_query.replace('~', '"'))
     headers = data.pop(0)
@@ -257,9 +259,12 @@ def process_export(descriptor_file):
                 if headers[ncolumn] in unlocked_columns:
                     logs.debug('Writing unlocked cell in column %d[%s]' % (ncolumn, headers[ncolumn]))
                     worksheet.write(nrow, ncolumn, item, unlocked)
-                else:
-                    logs.debug('Writing locked cell in column %d[%s]' % (ncolumn, headers[ncolumn]))
+                elif args.locked:
+                    logs.debug('Writing locked cell in column %d[%s] due to --unlocked parameter' % (ncolumn, headers[ncolumn]))
                     worksheet.write(nrow, ncolumn, item, locked)
+                else:
+                    logs.debug('Writing unlocked cell in column %d[%s]' % (ncolumn, headers[ncolumn]))
+                    worksheet.write(nrow, ncolumn, item, unlocked)
                 ncolumn += 1
             nrow += 1
 
@@ -267,13 +272,15 @@ def process_export(descriptor_file):
         if db_filename_prefix_col:
             worksheet.set_column(headers.index(db_filename_prefix_col), headers.index(db_filename_prefix_col), None, None, {'hidden': True})
 
-    # Iterate through all workbooks. Create Dropdown lists if needed.
+    # Iterate through all workbooks.
     for workbook in workbooks:
         prefix = workbook['prefix']
         name = workbook['name']
         workbook = workbook['workbook']
         hidden_row_counter = 1
         worksheet = workbook.worksheets()[0]
+
+        # Create Dropdown lists if needed.
         for col_mapping in sorted_col_mappings:
             if 'DDList' in col_mapping and col_mapping['DDList'].lower() in {'yes', 'true'}:
                 logs.info('Applying dropdown list validation on column "%s" in workbook %s' % (col_mapping['Source'], name))
@@ -292,9 +299,14 @@ def process_export(descriptor_file):
                 worksheet.set_row(len(data) + hidden_row_counter, None, None, {'hidden': True})
                 hidden_row_counter += 1
 
+        # Hide columns if specified
+        for hcolumn in hidden_columns:
+            column_index = headers.index(hcolumn['Column'])
+            logs.info('Hidding column %d[%s]' % (column_index, hcolumn))
+            worksheet.set_column(column_index, column_index, None, None, {'hidden': True})
+
         logs.info('Closing %s.' % os.path.join(source_location, source_file))
         workbook.close()
-
 
 def process_import(descriptor_file):
     # descriptor_file arg should be a relative path to a .json
